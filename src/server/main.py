@@ -5,21 +5,60 @@ from logger import setup_logger
 import select
 import queue
 
+class ClientConnection:
+    
+    def __init__(self, 
+                 conn, 
+                 addr, 
+                 master_queue):
+        
+        self.conn = conn
+        self.addr = addr
+        self.hostname = addr[0]
+        self.port = addr[1]
+        self.master_queue = master_queue
+        self.queue = queue.Queue()
+        self.format = 'UTF-8'
+        self.header = 64 
+        
+        self.notify_new_client()
+        
+    def notify_new_client(self):
+        logging.info(f'New Client: Connected by {self.addr[0]}:{self.addr[1]}')
+        self.master_queue.put({'type': 'NewClient', 'addr': self.addr, 'client_queue': self.queue})
+        
+    def send(self, msg):
+        msg_length = len(msg)
+        send_length = str(msg_length).encode(self.format)
+        send_length += b' ' * (self.header - len(send_length))
+        self.conn.send(send_length)
+        self.conn.send(msg.encode(self.format))
+        logging.info(f"Message Sent '{msg}' To {self.addr[0]}:{self.addr[1]}")
+        
+    def run(self):
+        while True:
+            readable, writeable, exception = select.select([self.conn], [self.conn], [])
+            if readable:
+                msg_length = self.conn.recv(self.header).decode(self.format)
+                if msg_length:
+                    msg_length = int(msg_length)
+                    msg = self.conn.recv(msg_length).decode(self.format)
+                    self.master_queue.put({'type': 'Message', 'msg': msg})
+                    logging.info(f"Message Recieved'{msg}' From {self.addr[0]}:{self.addr[1]}")
+            
+            if writeable:
+                if not self.queue.empty():
+                    item = self.queue.get()
+                    if item['type'] == 'Message':
+                        self.send(item['msg'])
 
-# Python Non blocking Terminal idea 1 
-# Put this all on git
-# Using Queue's to send messages to the server
-# There is a main thread that listens from messages
-# There is a thread and a queue that sends messages for each client 
-# https://docs.python.org/3/library/queue.html#queue-objects
-# https://docs.python.org/3/library/select.html
-
-
-#                                         / - [sending Queu][Client1]
-#[Client0] -> [listening Queue][Server]  - 
-#                                        \ - [sending Queu][Client2]
-
-class Server():
+    @classmethod
+    def setup(cls, conn, addr, master_queue):
+        client = cls(conn, addr, master_queue)
+        thread = threading.Thread(target=client.run)
+        thread.start()
+        
+class Server:
     def __init__(self, host, port):
         self.clients = {}
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -32,7 +71,7 @@ class Server():
         self.master_queue = queue.Queue()
 
         self.setup_listening_thread()
-        self._master_thread()
+        self.run()
 
     def setup_listening_thread(self):
         """
@@ -40,7 +79,6 @@ class Server():
         """
         thread = threading.Thread(target=self._listening_thread, args=())
         thread.start()
-        logging.info(f'Active threads: {threading.active_count() - 1}')
         return thread
 
     def _listening_thread(self):
@@ -50,40 +88,27 @@ class Server():
         self.server.listen()
         while True:
             conn, addr = self.server.accept()
-            client_queue = queue.Queue()
-            self.clients[addr] = client_queue
-            thread = threading.Thread(target=self._client_thread, args=(conn, addr, client_queue))
+            thread = threading.Thread(target=ClientConnection.setup, args=(conn, addr, self.master_queue))
             thread.start()
 
 
-    def _client_thread(self, conn, addr, client_queue):
-        connected = True
-        logging.info(f'Connected by {addr[0]}:{addr[1]}')
-        while connected:
-            readable, writeable, exception = select.select([conn], [], [])
-            if readable:
-                msg_length = conn.recv(self.header).decode(self.format)
-                if msg_length:
-                    msg_length = int(msg_length)
-                    msg = conn.recv(msg_length).decode(self.format)
-                    logging.info(f"Message recieved : '{msg}' From {addr[0]}:{addr[1]}")
-            if not client_queue.empty():
-                message = client_queue.get()
-                conn.send(message.encode(self.format))
-                logging.info(f"Message sent: '{message}' to {addr[0]}:{addr[1]}")
-
-        conn.close()
-
-
-    def _master_thread(self):
+    def run(self):
         while True:
             if not self.master_queue.empty():
                 item = self.master_queue.get()
                 if item['type'] == 'NewClient':
-                    logging.info(f'New Client: {item["addr"][0]}:{item["addr"][1]} added to main thread')
-                    self.clients[{item["addr"][0]}:{item["addr"][1]}] = item['client_queue']
-            else:
-                pass
+                    
+                    self.clients[f'{item["addr"][0]}:{item["addr"][1]}'] = item['client_queue']
+                    
+                    logging.debug(f'New Client: {item["addr"][0]}:{item["addr"][1]} has been added to the server broadcast list')
+                
+                elif item['type'] == 'Message':
+                    for client in self.clients:
+                        logging.debug(f'Message Broadcasted to {client}')
+                        self.clients[client].put({'type': 'Message', 'msg': item['msg']})
+
+
+
 
 if __name__ == "__main__":
     
